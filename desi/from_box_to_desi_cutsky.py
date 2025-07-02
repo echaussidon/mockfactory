@@ -85,7 +85,7 @@ def apply_rsd_and_cutsky(catalog, dmin, dmax, rsd_factor, center_ra=0, center_de
     # For data, we apply RSD *before* distance cuts
     data_cutsky['RSDPosition'] = data_cutsky.rsd_position(f=rsd_factor)
     # Collect distance, ra, dec
-    data_cutsky['DISTANCE'], data_cutsky['RA'], data_cutsky['DEC'] = utils.cartesian_to_sky(data_cutsky['RSDPosition'], wrap=True)
+    data_cutsky['DISTANCE'], data_cutsky['RA'], data_cutsky['DEC'] = utils.cartesian_to_sky(data_cutsky['RSDPosition'])
     # Apply selection function (purely geometric)
     # Note: mask_angular from isometry_for_cutsky does not work correcty -> good news we do not need it since we match the n(z) and the desi tiles after.
     #mask = mask_radial(data_cutsky['DISTANCE']) & mask_angular(data_cutsky['RA'], data_cutsky['DEC'])

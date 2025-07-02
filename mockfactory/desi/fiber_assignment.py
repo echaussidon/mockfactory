@@ -1,12 +1,8 @@
 """
 Script to apply fiber assignment from pre-loaded catalogs.
 
-This example can be run with `srun -n 5 python fiber_assignment.py` (will take typically 1 minute for 1 pass),
-but one will typically import:
-```
-from mockfactory.fiber_assignment import apply_fiber_assignment
-```
-For an example, see desi/apply_fiber_assignment_example.py script.
+This script is designed to be run in parallel using MPI. It uses the `mpytools` library for handling large catalogs and the `fiberassign` package for fiber assignment.
+
 """
 
 import os
@@ -80,58 +76,7 @@ def _run_assign_init(args, tile, targets, plate_radec=True, use_sky_targets=True
     Instead of reading files, use preloaded targets and tiles.
     """
     from fiberassign.hardware import load_hardware
-
-    def convert_tiles_to_fiberassign(args, tile):
-        """
-        Adapted from https://github.com/desihub/fiberassign/blob/8e6e8264bf80fde07162de5e3f5343c621d65e3e/py/fiberassign/tiles.py.
-        Do not read the tiles, but take it as an array...
-        """
-        import warnings
-        from desimodel.focalplane.fieldrot import field_rotation_angle
-        import astropy.time
-        from fiberassign._internal import Tiles
-
-        # astropy ERFA doesn't like the future
-        warnings.filterwarnings('ignore', message=r'ERFA function \"[a-z0-9_]+\" yielded [0-9]+ of \"dubious year')
-
-        if args.obsdate is not None:
-            # obstime is given, use that for all tiles
-            obsdate = astropy.time.Time(args.obsdate)
-            #obsmjd = [obsdate.mjd, ] * tiles.shape[0]
-            #obsdatestr = [obsdate.isot, ] * tiles.shape[0]
-            obsmjd = [obsdate.mjd, ] * len(tile)
-            obsdatestr = [obsdate.isot, ] * len(tile)
-        elif "OBSDATE" in tile.names:
-            # We have the obsdate for every tile in the file.
-            obsdate = [astropy.time.Time(x) for x in tile["OBSDATE"]]
-            obsmjd = [x.mjd for x in obsdate]
-            obsdatestr = [x.isot for x in obsdate]
-        else:
-            # default to middle of the survey
-            obsdate = astropy.time.Time('2022-07-01')
-            #obsmjd = [obsdate.mjd, ] * tiles.shape[0]
-            #obsdatestr = [obsdate.isot, ] * tiles.shape[0]
-            obsmjd = [obsdate.mjd, ] * len(tile)
-            obsdatestr = [obsdate.isot, ] * len(tile)
-
-        # Eventually, call a function from desimodel to query the field
-        # rotation and hour angle for every tile time.
-        if args.fieldrot is None:
-            theta_obs = list()
-            for tra, tdec, mjd in zip(tile["RA"], tile["DEC"], obsmjd):
-                th = field_rotation_angle(tra, tdec, mjd)
-                theta_obs.append(th)
-            theta_obs = np.array(theta_obs)
-        else:
-            theta_obs = np.zeros(len(tile), dtype=np.float64)
-            theta_obs[:] = args.fieldrot
-
-        # default to zero Hour Angle; may be refined later
-        ha_obs = np.zeros(len(tile), dtype=np.float64)
-        if args.ha is not None:
-            ha_obs[:] = args.ha
-
-        return Tiles(tile["TILEID"], tile["RA"], tile["DEC"], tile["OBSCONDITIONS"], obsdatestr, theta_obs, ha_obs)
+    from fiberassign._internal import Tiles
 
     def convert_targets_to_fiberassign(args, targets, tile, program, use_sky_targets=True):
         """
@@ -168,8 +113,8 @@ def _run_assign_init(args, tile, targets, plate_radec=True, use_sky_targets=True
     # Read hardware properties
     t_start = MPI.Wtime()
     fafn = "/dvs_ro/cfs/cdirs/desi/target/fiberassign/tiles/trunk/{}/fiberassign-{}.fits.gz"
-    rundate = fitsio.read_header(fafn.format(f"{tile['TILEID'][0]:06d}"[:3], f"{tile['TILEID'][0]:06d}"), 0)['RUNDATE']
-    hw = load_hardware(rundate=rundate)
+    hdr = fitsio.read_header(fafn.format(f"{tile['TILEID'][0]:06d}"[:3], f"{tile['TILEID'][0]:06d}"), 0)
+    hw = load_hardware(rundate=hdr['RUNDATE'])
     logger.debug(f'                **** load_hardware took: {MPI.Wtime() - t_start:2.2f} s.')
 
     # Convert target to fiberassign.Targets Class
@@ -179,7 +124,7 @@ def _run_assign_init(args, tile, targets, plate_radec=True, use_sky_targets=True
 
     # Convert tiles to fiberassign.Tiles Class
     t_start = MPI.Wtime()
-    tile = convert_tiles_to_fiberassign(args, tile)
+    tile = Tiles(tile["TILEID"], tile["RA"], tile["DEC"], tile["OBSCONDITIONS"], [hdr["FA_PLAN"]]*len(tile), [hdr["FIELDROT"]]*len(tile), [hdr["FA_HA"]]*len(tile))
     logger.debug(f'                **** convert_tiles_to_fiberassign took: {MPI.Wtime() - t_start:2.2f} s.')
 
     return (hw, tile, tgs, tagalong)
@@ -343,17 +288,18 @@ def _apply_mtl_one_tile(targets, tg_assign, tg_available, tileid):
     """
     from desitarget.geomask import match
     from desitarget.targetmask import zwarn_mask
-    from pandas import read_csv
+    from astropy.table import Table
     from mpytools import Catalog
 
     # first load which fibers are correclty worked in the real life:
     t_start = MPI.Wtime()
     # collect LASNIGHT value corresponding to the tileid
-    tile_info = read_csv('/dvs_ro/cfs/cdirs/desi/spectro/redux/loa/tiles-loa.csv')
-    lastnight = tile_info['LASTNIGHT'][tile_info['TILEID'] == tileid].values[0]  # not super user-friendly.. 
+    tile_info = Table.read('/dvs_ro/cfs/cdirs/desi/survey/ops/surveyops/trunk/ops/tiles-specstatus.ecsv')
+    tile_info = tile_info[tile_info['TILEID'] == tileid]
+    archivdate, lastnight = tile_info['ARCHIVEDATE'], tile_info['LASTNIGHT']
     # read zmtl files (Note: we want to work with the daily version since this is what the MTL works with)
     # warning, these data directory are shit; files are missing when something goes wrong ... 
-    zmtl_fn = [f'/dvs_ro/cfs/cdirs/desi/spectro/redux/daily/tiles/cumulative/{tileid}/{lastnight}/zmtl-{petal}-{tileid}-thru{lastnight}.fits' for petal in range(10)]
+    zmtl_fn = [f'/dvs_ro/cfs/cdirs/desi/spectro/redux/daily/tiles/archive/{tileid}/{lastnight}/zmtl-{petal}-{tileid}-thru{lastnight}.fits' for petal in range(10)]
     zwarn = []
     for i in range(10):
         if os.path.isfile(zmtl_fn[i]):
