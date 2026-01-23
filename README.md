@@ -77,8 +77,10 @@ Strict requirements are:
   - numpy
   - scipy
   - mpi4py
-  - pmesh
   - mpytools
+
+Optional requirements are:
+  - pmesh
 
 ## Installation
 
